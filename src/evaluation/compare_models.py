@@ -7,6 +7,14 @@ import yaml
 from pathlib import Path
 from sklearn.metrics import f1_score, recall_score, precision_score, roc_auc_score, accuracy_score
 
+# TensorFlow import is optional — compare_models works even if TF is not installed,
+# it will simply skip the Neural Network entry if the .keras file is missing.
+try:
+    from tensorflow import keras as _keras
+    _TF_AVAILABLE = True
+except ImportError:
+    _TF_AVAILABLE = False
+
 # ==========================================
 # CONFIGURATION
 # ==========================================
@@ -37,7 +45,8 @@ def load_config():
 
 def evaluate_model(model_path, X, y, model_name="Model", threshold=None):
     """
-    Evaluates a model. If threshold is provided, uses it for predictions.
+    Evaluates a joblib-serialised sklearn/XGBoost/RF model.
+    If threshold is provided, uses it for predictions.
     """
     if not model_path.exists():
         print(f"[WARN] {model_name} not found at {model_path.name}. Skipping.")
@@ -62,6 +71,52 @@ def evaluate_model(model_path, X, y, model_name="Model", threshold=None):
         else:
             # Default Model Behavior (usually 0.5)
             y_pred = model.predict(X)
+
+        return {
+            "Accuracy": accuracy_score(y, y_pred),
+            "Precision": precision_score(y, y_pred, zero_division=0),
+            "Recall": recall_score(y, y_pred),
+            "F1-Score": f1_score(y, y_pred),
+            "ROC-AUC": roc_auc_score(y, y_prob),
+        }
+    except Exception as e:
+        print(f"[ERROR] Failed to evaluate {model_name}: {e}")
+        return None
+
+
+def evaluate_nn_model(model_path, X, y, model_name="Neural Network", threshold=0.5):
+    """
+    Evaluates a Keras Neural Network model stored in the .keras format.
+
+    Keras models are NOT joblib-compatible — they must be loaded with
+    keras.models.load_model().  This function mirrors evaluate_model() but
+    handles the TF-specific loading and prediction interface.
+
+    Parameters
+    ----------
+    model_path : Path
+        Path to the .keras model file.
+    X : np.ndarray
+        Feature matrix (already preprocessed / scaled).
+    y : array-like
+        True binary labels.
+    threshold : float
+        Decision threshold for converting sigmoid output to {0, 1}.
+    """
+    if not _TF_AVAILABLE:
+        print("[WARN] TensorFlow not available. Skipping Neural Network evaluation.")
+        return None
+
+    if not model_path.exists():
+        print(f"[WARN] {model_name} not found at {model_path.name}. Skipping.")
+        return None
+
+    try:
+        model = _keras.models.load_model(str(model_path))
+
+        # predict() returns shape (n_samples, 1) for a single-output sigmoid
+        y_prob = model.predict(X, verbose=0).ravel()
+        y_pred = (y_prob >= threshold).astype(int)
 
         return {
             "Accuracy": accuracy_score(y, y_pred),
@@ -165,6 +220,30 @@ def run_comparison():
     )
     if opt_weighted_metrics:
         all_metrics["Champion"] = opt_weighted_metrics
+
+    # --- C. Neural Network baseline (Phase 4) ---
+    nn_threshold = thresholds_dict.get("neural_network_model", default_threshold)
+    nn_metrics = evaluate_nn_model(
+        MODELS_DIR / "neural_network_model.keras",
+        X_val.values,  # convert DataFrame -> numpy for Keras
+        y_val.values,
+        model_name=f"Neural Network (Thresh={nn_threshold:.3f})",
+        threshold=nn_threshold,
+    )
+    if nn_metrics:
+        all_metrics["Neural Network"] = nn_metrics
+
+    # --- D. Neural Network Optuna-tuned (Phase 4 improved) ---
+    nn_opt_threshold = thresholds_dict.get("neural_network_optuna", default_threshold)
+    nn_opt_metrics = evaluate_nn_model(
+        MODELS_DIR / "neural_network_optuna.keras",
+        X_val.values,
+        y_val.values,
+        model_name=f"NN Optuna (Thresh={nn_opt_threshold:.3f})",
+        threshold=nn_opt_threshold,
+    )
+    if nn_opt_metrics:
+        all_metrics["NN Optuna"] = nn_opt_metrics
 
     # 4. Generate DataFrame and Plot
     if not all_metrics:
